@@ -206,6 +206,7 @@ nav{position:fixed;bottom:0;left:0;right:0;background:rgba(2,6,9,0.92);backdrop-
 </head>
 <body>
 
+<audio id="ios-silent" src="data:audio/mpeg;base64,SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU4LjI5LjEwMAAAAAAAAAAAAAAA//OEAAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAAEAAABIADAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV6urq6urq6urq6urq6urq6urq6urq6urq6v////////////////////////////////8AAAAATGF2YzU4LjU0AAAAAAAAAAAAAAAAJAAAAAAAAAAAASDs90hvAAAAAAAAAAAAAAAAAAAA//MUZAAAAAGkAAAAAAAAA0gAAAAATEFN//MUZAMAAAGkAAAAAAAAA0gAAAAARTMu//MUZAYAAAGkAAAAAAAAA0gAAAAAOTku//MUZAkAAAGkAAAAAAAAA0gAAAAANVVV" loop preload="auto" style="display:none"></audio>
 <div id="splash">
   <div class="splash-logo">
     <div class="splash-bars">
@@ -574,35 +575,59 @@ function getAudioCtx(){
   return audioCtx;
 }
 
-function unlockAudio(){
-  // Always call synchronously inside a touch/click handler — never await
+// Returns a Promise that resolves when AudioContext is running
+function ensureAudioReady(){
   const AC = window.AudioContext || window.webkitAudioContext;
   if(!audioCtx) audioCtx = new AC();
   const ctx = audioCtx;
-  // Resume if suspended — don't await, just fire
-  if(ctx.state === 'suspended') ctx.resume().catch(()=>{});
-  // Play silent oscillator to wake DSP (critical for iOS)
+  if(ctx.state === 'running') return Promise.resolve(ctx);
+  return ctx.resume().then(()=> ctx);
+}
+
+// THE definitive iOS audio unlock:
+// iOS blocks Web Audio when mute switch is on.
+// The ONLY fix: play a looping silent <audio> tag to claim the media channel,
+// then the AudioContext works even with mute switch on.
+function unlockAudio(){
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if(!audioCtx) audioCtx = new AC();
+  const ctx = audioCtx;
+
+  // Step 1: Resume context if suspended
+  if(ctx.state !== 'running'){
+    ctx.resume().catch(()=>{});
+  }
+
+  // Step 2: Play the silent looping <audio> tag.
+  // This forces iOS to route Web Audio to the media channel (not ringer),
+  // which means it works even when the mute switch is on.
+  const silentEl = document.getElementById('ios-silent');
+  if(silentEl && silentEl.paused){
+    silentEl.volume = 0.001;
+    silentEl.play().catch(()=>{});
+  }
+
+  // Step 3: Play a silent buffer through the AudioContext itself
+  // This "warms up" the DSP pipeline on first gesture
   try{
-    const o=ctx.createOscillator(),g=ctx.createGain();
-    o.frequency.value=440; g.gain.value=0.00001;
-    o.connect(g); g.connect(ctx.destination);
-    o.start(ctx.currentTime); o.stop(ctx.currentTime+0.001);
-  }catch(e){}
-  // HTML5 Audio silent WAV (fixes iOS mute switch & some Android)
-  try{
-    const a=new Audio();
-    a.src='data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
-    a.volume=0.001; a.play().catch(()=>{});
+    const buf = ctx.createBuffer(1, ctx.sampleRate * 0.1, ctx.sampleRate);
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(ctx.destination);
+    src.start(0);
   }catch(e){}
 }
 
 function audioStart(){
-  const ctx=getAudioCtx();
   if(S.isPlaying) return;
-  S.isPlaying=true;
-  current16th=0;currentBeatIdx=0;barCount=0;
-  nextNoteTime=ctx.currentTime+0.05;
-  scheduler();
+  // Wait for context to actually be running before scheduling notes
+  ensureAudioReady().then(ctx => {
+    S.isPlaying=true;
+    current16th=0; currentBeatIdx=0; barCount=0;
+    // Use a larger initial offset to give context time to fully start
+    nextNoteTime = ctx.currentTime + 0.2;
+    scheduler();
+  }).catch(()=>{});
 }
 
 function audioStop(){
@@ -902,18 +927,18 @@ function updateStepVisual(step){
 // CONTROLS
 // ═══════════════════════════════════════════
 function togglePlay(){
+  // ALWAYS unlock first — synchronously inside this gesture handler
   unlockAudio();
   if(S.isPlaying){
     audioStop();
     S.currentStep=-1;
     lastHighlighted=-1;
     updatePlayBtn();
-    // Reset highlights
     buildSequencer('seq-grid','beat-labels','colorbar',S.pattern,S.timeSig);
     if(S.selectedEx) buildSequencer('seq-grid-game','beat-labels-game','colorbar-game',S.pattern,S.timeSig,true);
   } else {
-    audioStart();
-    updatePlayBtn();
+    updatePlayBtn(); // show STOP immediately for responsive feel
+    audioStart();    // internally waits for ctx.resume() via Promise
   }
 }
 
@@ -1194,23 +1219,28 @@ function init(){
 }
 
 // ── SPLASH: AudioContext MUST be created inside a direct user gesture ──
-// This is the only reliable way to unlock audio on iOS Safari
-document.getElementById('splash-btn').addEventListener('touchend', dismissSplash, {passive:false});
-document.getElementById('splash-btn').addEventListener('click', dismissSplash);
-
+// Using touchstart (not touchend/click) — iOS Safari recognises touchstart
+// as a trusted gesture for AudioContext creation
 function dismissSplash(e){
-  e.preventDefault();
-  e.stopPropagation();
-  // Create & unlock AudioContext RIGHT HERE inside the gesture handler
+  // Do NOT preventDefault here — that can break gesture recognition on iOS
+  // Create & resume AudioContext immediately inside this trusted gesture
   unlockAudio();
-  // Hide splash
   const splash = document.getElementById('splash');
   splash.classList.add('hide');
   setTimeout(()=>{ splash.style.display='none'; }, 420);
-  // Also re-unlock on every subsequent play press (belt & suspenders)
-  document.getElementById('play-btn').addEventListener('touchend', ()=>unlockAudio(), {passive:true});
-  document.getElementById('play-btn').addEventListener('click', ()=>unlockAudio(), {passive:true});
+  // Re-unlock on every play button press as belt-and-suspenders
+  ['play-btn','play-btn-game'].forEach(id=>{
+    const btn = document.getElementById(id);
+    if(btn){
+      btn.addEventListener('touchstart', ()=>unlockAudio(), {passive:true});
+      btn.addEventListener('click', ()=>unlockAudio(), {passive:true});
+    }
+  });
 }
+
+// touchstart fires immediately on tap — most reliable for iOS gesture detection
+document.getElementById('splash-btn').addEventListener('touchstart', dismissSplash, {passive:true});
+document.getElementById('splash-btn').addEventListener('click', dismissSplash);
 
 init();
 </script>
