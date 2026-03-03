@@ -166,9 +166,64 @@ nav{position:fixed;bottom:0;left:0;right:0;background:rgba(2,6,9,0.92);backdrop-
 /* Animations */
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:0.6}}
 .playing-pulse{animation:pulse 1s ease-in-out infinite}
+
+/* ── SPLASH SCREEN ── */
+#splash{
+  position:fixed;inset:0;z-index:9999;
+  background:#020609;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:32px;padding:40px;
+  transition:opacity 0.4s ease;
+}
+#splash.hide{opacity:0;pointer-events:none;}
+.splash-logo{
+  width:80px;height:80px;border-radius:24px;
+  background:linear-gradient(135deg,#0ea5e9,#38BDF8);
+  box-shadow:0 0 40px #0ea5e960;
+  display:flex;align-items:center;justify-content:center;
+}
+.splash-bars{display:flex;gap:4px;align-items:flex-end;height:36px;}
+.splash-bars span{width:4px;border-radius:3px;background:white;}
+.splash-title{font-size:28px;font-weight:800;letter-spacing:-0.03em;text-align:center;color:#e2e8f0;}
+.splash-sub{font-size:14px;color:#475569;text-align:center;line-height:1.5;max-width:260px;}
+.splash-btn{
+  width:100%;max-width:300px;
+  padding:18px 24px;
+  border-radius:20px;
+  background:linear-gradient(135deg,#0ea5e9,#38BDF8);
+  color:#020609;
+  font-size:17px;font-weight:800;
+  letter-spacing:-0.01em;
+  border:none;cursor:pointer;
+  box-shadow:0 0 40px #0ea5e950;
+  transition:transform .1s, box-shadow .1s;
+  font-family:'DM Sans',sans-serif;
+}
+.splash-btn:active{transform:scale(0.97);}
+.splash-version{font-size:11px;color:#334155;letter-spacing:.15em;text-transform:uppercase;}
+
 </style>
 </head>
 <body>
+
+<div id="splash">
+  <div class="splash-logo">
+    <div class="splash-bars">
+      <span style="height:14px"></span>
+      <span style="height:28px"></span>
+      <span style="height:20px"></span>
+      <span style="height:28px"></span>
+      <span style="height:12px"></span>
+    </div>
+  </div>
+  <div>
+    <div class="splash-title">Régua Rítmica</div>
+    <div class="splash-version" style="text-align:center;margin-top:6px;">v2.0</div>
+  </div>
+  <div class="splash-sub">Toque para começar e ativar o áudio no seu dispositivo</div>
+  <button class="splash-btn" id="splash-btn">▶ &nbsp; Tocar para Começar</button>
+</div>
+
 <div id="app">
 
 <header>
@@ -511,6 +566,7 @@ const SCHEDULE_AHEAD = 0.1;
 const NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
 
 function getAudioCtx(){
+  // AudioContext must already exist (created inside user gesture via splash)
   if(!audioCtx){
     const AC = window.AudioContext || window.webkitAudioContext;
     audioCtx = new AC();
@@ -519,18 +575,24 @@ function getAudioCtx(){
 }
 
 function unlockAudio(){
-  const ctx = getAudioCtx();
-  if(ctx.state==='suspended') ctx.resume().catch(()=>{});
+  // Always call synchronously inside a touch/click handler — never await
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if(!audioCtx) audioCtx = new AC();
+  const ctx = audioCtx;
+  // Resume if suspended — don't await, just fire
+  if(ctx.state === 'suspended') ctx.resume().catch(()=>{});
+  // Play silent oscillator to wake DSP (critical for iOS)
   try{
     const o=ctx.createOscillator(),g=ctx.createGain();
-    o.frequency.value=220;g.gain.value=0.0001;
-    o.connect(g);g.connect(ctx.destination);
-    o.start(0);o.stop(0.01);
+    o.frequency.value=440; g.gain.value=0.00001;
+    o.connect(g); g.connect(ctx.destination);
+    o.start(ctx.currentTime); o.stop(ctx.currentTime+0.001);
   }catch(e){}
+  // HTML5 Audio silent WAV (fixes iOS mute switch & some Android)
   try{
     const a=new Audio();
     a.src='data:audio/wav;base64,UklGRigAAABXQVZFZm10IBIAAAABAAEARKwAAIhYAQACABAAAABkYXRhAgAAAAEA';
-    a.volume=0.001;a.play().catch(()=>{});
+    a.volume=0.001; a.play().catch(()=>{});
   }catch(e){}
 }
 
@@ -1120,24 +1182,34 @@ function updateSliderStyle(id, color='#38BDF8'){
 function init(){
   // Build sequencer
   buildSequencer('seq-grid','beat-labels','colorbar',S.pattern,S.timeSig);
-
   // Build mixer
   renderMixer();
-
-  // Harmony (lazy)
   // Render exercises
   renderExercises();
-
   // Slider styles
   updateSliderStyle('bpm-slider','#38BDF8');
   updateSliderStyle('vol-met','#38BDF8');
   updateSliderStyle('vol-rhy','#F87171');
   updateSliderStyle('vol-bck','#A78BFA');
+}
 
-  // Global unlock
-  ['click','touchstart'].forEach(ev=>{
-    document.addEventListener(ev, ()=>unlockAudio(), {once:true});
-  });
+// ── SPLASH: AudioContext MUST be created inside a direct user gesture ──
+// This is the only reliable way to unlock audio on iOS Safari
+document.getElementById('splash-btn').addEventListener('touchend', dismissSplash, {passive:false});
+document.getElementById('splash-btn').addEventListener('click', dismissSplash);
+
+function dismissSplash(e){
+  e.preventDefault();
+  e.stopPropagation();
+  // Create & unlock AudioContext RIGHT HERE inside the gesture handler
+  unlockAudio();
+  // Hide splash
+  const splash = document.getElementById('splash');
+  splash.classList.add('hide');
+  setTimeout(()=>{ splash.style.display='none'; }, 420);
+  // Also re-unlock on every subsequent play press (belt & suspenders)
+  document.getElementById('play-btn').addEventListener('touchend', ()=>unlockAudio(), {passive:true});
+  document.getElementById('play-btn').addEventListener('click', ()=>unlockAudio(), {passive:true});
 }
 
 init();
